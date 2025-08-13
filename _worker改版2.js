@@ -1873,65 +1873,103 @@ async function handleUploadRequest(request, config) {
       .bind(storageType, finalCategoryId, chatId).run();
     const ext = (file.name.split('.').pop() || '').toLowerCase();
     const mimeType = getContentType(ext);
-    const [mainType] = mimeType.split('/');
-    const typeMap = {
-      image: { method: 'sendPhoto', field: 'photo' },
-      video: { method: 'sendVideo', field: 'video' },
-      audio: { method: 'sendAudio', field: 'audio' }
-    };
-    let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
-    if (['application', 'text'].includes(mainType)) {
-      method = 'sendDocument';
-      field = 'document';
-    }
+    const [mainType, subType] = mimeType.split('/');
     let finalUrl, dbFileId, dbMessageId;
     if (storageType === 'r2') {
-      const key = `${Date.now()}.${ext}`;
+      const key = `${Date.now()}_${file.name}`;
       await config.bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: mimeType } });
       finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
       dbMessageId = -1;
     } else {
+      let method = 'sendDocument';
+      let field = 'document';
+      //--- START OF FIX: SVG and special image handling ---
+      if (mainType === 'image' && !['svg+xml', 'x-icon', 'gif'].includes(subType)) {
+        method = 'sendPhoto';
+        field = 'photo';
+      } else if (mainType === 'video') {
+        method = 'sendVideo';
+        field = 'video';
+      } else if (mainType === 'audio') {
+        method = 'sendAudio';
+        field = 'audio';
+      }
+      //--- END OF FIX ---
+      
+      let messageId = null;
+      let fileId = null;
       const tgFormData = new FormData();
       tgFormData.append('chat_id', config.tgStorageChatId);
       tgFormData.append(field, file, file.name);
+
       const tgResponse = await fetch(
         `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
         { method: 'POST', body: tgFormData }
       );
-      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
-      const tgData = await tgResponse.json();
-      const result = tgData.result;
-      const messageId = result.message_id;
-      const fileId = result.document?.file_id ||
-                     result.video?.file_id ||
-                     result.audio?.file_id ||
-                     (result.photo && result.photo[result.photo.length - 1]?.file_id);
+
+      //--- START OF FIX: Fallback to sendDocument ---
+      if (!tgResponse.ok) {
+        const errorText = await tgResponse.text();
+        console.error(`Telegram API错误 (${method}):`, errorText);
+        if (method !== 'sendDocument') {
+          console.log('尝试使用sendDocument方法重新上传');
+          const retryFormData = new FormData();
+          retryFormData.append('chat_id', config.tgStorageChatId);
+          retryFormData.append('document', file, file.name);
+          const retryResponse = await fetch(
+            `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
+            { method: 'POST', body: retryFormData }
+          );
+          if (!retryResponse.ok) {
+            console.error('Telegram文档上传也失败:', await retryResponse.text());
+            throw new Error('Telegram文件上传失败');
+          }
+          const retryData = await retryResponse.json();
+          const retryResult = retryData.result;
+          messageId = retryResult.message_id;
+          fileId = retryResult.document?.file_id;
+        } else {
+            throw new Error('Telegram参数配置错误: ' + errorText);
+        }
+      } else {
+        const tgData = await tgResponse.json();
+        const result = tgData.result;
+        messageId = result.message_id;
+        if (field === 'photo') {
+          const photos = result.photo;
+          fileId = photos[photos.length - 1]?.file_id;
+        } else {
+          fileId = result.document?.file_id || result.video?.file_id || result.audio?.file_id;
+        }
+      }
+      //--- END OF FIX ---
+
       if (!fileId) throw new Error('未获取到文件ID');
       if (!messageId) throw new Error('未获取到tg消息ID');
-      finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
+      
+      finalUrl = `https://${config.domain}/${Date.now()}_${file.name}`;
       dbFileId = fileId;
       dbMessageId = messageId;
     }
     const time = Date.now();
-    const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-    const url = `https://${config.domain}/${time}.${ext}`;
     await config.database.prepare(`
-      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id, chat_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      url,
+      finalUrl,
       dbFileId,
       dbMessageId,
-      timestamp,
+      time,
       file.name,
       file.size,
-      file.type || getContentType(ext),
+      file.type || mimeType,
       storageType,
-      finalCategoryId
+      finalCategoryId,
+      chatId
     ).run();
     return new Response(
-      JSON.stringify({ status: 1, msg: "✔ 上传成功", url }),
+      JSON.stringify({ status: 1, msg: "✔ 上传成功", url: finalUrl }),
       { headers: { 'Content-Type': 'application/json' } }
     );
   } catch (error) {
@@ -1939,7 +1977,7 @@ async function handleUploadRequest(request, config) {
     let statusCode = 500;
     if (error.message.includes(`文件超过${config.maxSizeMB}MB限制`)) {
       statusCode = 400;
-    } else if (error.message.includes('Telegram参数配置错误')) {
+    } else if (error.message.includes('Telegram')) {
       statusCode = 502;
     } else if (error.message.includes('未获取到文件ID') || error.message.includes('未获取到tg消息ID')) {
       statusCode = 500;
@@ -2062,19 +2100,21 @@ async function handleAdminRequest(request, config) {
         const storageType = file.storage_type || 'telegram';
         return `
           <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
-            <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
-            <div class="file-preview">
-              ${getPreviewHtml(url)}
-            </div>
-            <div class="file-info">
-                <div class="info-item name-col" title="${getFileName(url)}\n原名: ${sanitizedFileName || '无'}">
-                    <b>新名称:</b> ${getFileName(url)} <span class="storage-badge storage-${storageType}">${storageType.toUpperCase()}</span><br>
-                    <span class="original-name"><b>原名:</b> ${sanitizedFileName || '无'}</span>
+            <div class="file-info-wrapper">
+                <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
+                <div class="file-preview">
+                  ${getPreviewHtml(url)}
                 </div>
-                <div class="info-item size-col"><b>大小:</b> ${formatSize(file.file_size)}</div>
-                <div class="info-item date-col" title="${fullDate}"><b>上传于:</b> ${fullDate}</div>
-                <div class="info-item category-col"><b>分类:</b> <span class="category-name">${file.category_name || '无分类'}</span></div>
-                <div class="info-item remark-col" title="${sanitizedRemark || '无'}"><b>备注:</b> <span class="remark-text">${sanitizedRemark || '无'}</span></div>
+                <div class="file-info">
+                    <div class="info-item name-col" title="${getFileName(url)}\n原名: ${sanitizedFileName || '无'}">
+                        <b>新名称:</b> ${getFileName(url)} <span class="storage-badge storage-${storageType.toLowerCase()}">${storageType.toUpperCase()}</span><br>
+                        <span class="original-name"><b>原名:</b> ${sanitizedFileName || '无'}</span>
+                    </div>
+                    <div class="info-item size-col"><b>大小:</b> ${formatSize(file.file_size)}</div>
+                    <div class="info-item date-col" title="${fullDate}"><b>上传于:</b> ${fullDate}</div>
+                    <div class="info-item category-col"><b>分类:</b> <span class="category-name">${file.category_name || '无分类'}</span></div>
+                    <div class="info-item remark-col" title="${sanitizedRemark || '无'}"><b>备注:</b> <span class="remark-text">${sanitizedRemark || '无'}</span></div>
+                </div>
             </div>
             <div class="file-actions">
               <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
@@ -2121,19 +2161,21 @@ async function handleSearchRequest(request, config) {
              const storageType = file.storage_type || 'telegram';
              return `
               <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
-                <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
-                <div class="file-preview">
-                  ${getPreviewHtml(url)}
-                </div>
-                <div class="file-info">
-                  <div class="info-item name-col" title="${getFileName(url)}\n原名: ${sanitizedFileName || '无'}">
-                      <b>新名称:</b> ${getFileName(url)} <span class="storage-badge storage-${storageType}">${storageType.toUpperCase()}</span><br>
-                      <span class="original-name"><b>原名:</b> ${sanitizedFileName || '无'}</span>
-                  </div>
-                  <div class="info-item size-col"><b>大小:</b> ${formatSize(file.file_size)}</div>
-                  <div class="info-item date-col" title="${fullDate}"><b>上传于:</b> ${fullDate}</div>
-                  <div class="info-item category-col"><b>分类:</b> <span class="category-name">${file.category_name || '无分类'}</span></div>
-                  <div class="info-item remark-col" title="${sanitizedRemark || '无'}"><b>备注:</b> <span class="remark-text">${sanitizedRemark || '无'}</span></div>
+                 <div class="file-info-wrapper">
+                    <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
+                    <div class="file-preview">
+                      ${getPreviewHtml(url)}
+                    </div>
+                    <div class="file-info">
+                      <div class="info-item name-col" title="${getFileName(url)}\n原名: ${sanitizedFileName || '无'}">
+                          <b>新名称:</b> ${getFileName(url)} <span class="storage-badge storage-${storageType.toLowerCase()}">${storageType.toUpperCase()}</span><br>
+                          <span class="original-name"><b>原名:</b> ${sanitizedFileName || '无'}</span>
+                      </div>
+                      <div class="info-item size-col"><b>大小:</b> ${formatSize(file.file_size)}</div>
+                      <div class="info-item date-col" title="${fullDate}"><b>上传于:</b> ${fullDate}</div>
+                      <div class="info-item category-col"><b>分类:</b> <span class="category-name">${file.category_name || '无分类'}</span></div>
+                      <div class="info-item remark-col" title="${sanitizedRemark || '无'}"><b>备注:</b> <span class="remark-text">${sanitizedRemark || '无'}</span></div>
+                    </div>
                 </div>
                 <div class="file-actions">
                   <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
@@ -3466,12 +3508,18 @@ function generateAdminPage(fileCards, categoryOptions) {
         background: rgba(255, 255, 255, 0.95); border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         overflow: hidden; position: relative; transition: all 0.3s ease; cursor: pointer;
         display: flex; flex-direction: column;
-        outline: 3px solid transparent; /* Use outline for selection */
-        outline-offset: -3px; /* Draw outline inside */
+        outline: 3px solid transparent;
+        outline-offset: -3px;
       }
       .grid-view .file-card:hover { transform: translateY(-5px); box-shadow: 0 8px 20px rgba(0,0,0,0.15); }
       .grid-view .file-card.selected {
         outline-color: #3498db;
+      }
+      .grid-view .file-info-wrapper {
+        display: flex;
+        flex-direction: column;
+        flex-grow: 1;
+        position: relative;
       }
       .grid-view .file-checkbox { position: absolute; top: 10px; left: 10px; z-index: 5; width: 20px; height: 20px; }
       .grid-view .file-preview { height: 150px; background: #f8f9fa; display: flex; align-items: center; justify-content: center; }
@@ -3489,7 +3537,7 @@ function generateAdminPage(fileCards, categoryOptions) {
           padding: 0 1rem; gap: 1rem; margin-bottom: 0.5rem; font-weight: bold; color: #2c3e50;
           align-items: center;
       }
-      .list-header > div:first-child { grid-column: 2 / span 1; } /* Align header text correctly */
+      .list-header > div:first-child { grid-column: 2; }
       .list-view .file-card {
         display: grid;
         grid-template-columns: var(--list-grid-columns);
@@ -3500,10 +3548,9 @@ function generateAdminPage(fileCards, categoryOptions) {
       .list-view .file-card:hover { background: #f8f9fa; }
       .list-view .file-card.selected { background: #eaf5ff; }
       .list-view .file-preview { display: none; }
-      .list-view .file-checkbox { position: static; margin-right: 0; flex-shrink: 0; }
-      .list-view .file-info {
-        display: contents; /* Let info items be direct children of the card's grid */
-      }
+      .list-view .file-info-wrapper { display: contents; }
+      .list-view .file-info { display: contents; }
+      .list-view .file-checkbox { position: static; margin: 0; }
       .list-view .info-item { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; padding-right: 1rem; }
       .list-view .name-col .original-name { font-size: 0.8em; color: #7f8c8d; }
       .list-view .file-actions { padding: 0; border-top: none; display: flex; gap: 0.5rem; }
@@ -3548,10 +3595,8 @@ function generateAdminPage(fileCards, categoryOptions) {
         :root {
             --list-grid-columns: 40px 2fr 1fr 1.2fr 135px;
         }
-        .list-header .category-col,
-        .list-view .file-card .category-col,
-        .list-header .remark-col,
-        .list-view .file-card .remark-col { display: none; }
+        .list-header .category-col, .list-view .category-col,
+        .list-header .remark-col, .list-view .remark-col { display: none; }
       }
       @media (max-width: 768px) {
         body { padding: 10px; }
@@ -3566,14 +3611,10 @@ function generateAdminPage(fileCards, categoryOptions) {
             --list-grid-columns: 40px 1fr 135px;
          }
          .grid-view { grid-template-columns: 1fr; }
-         .list-header .size-col,
-         .list-view .file-card .size-col,
-         .list-header .date-col,
-         .list-view .file-card .date-col,
-         .list-header .category-col,
-         .list-view .file-card .category-col,
-         .list-header .remark-col,
-         .list-view .file-card .remark-col { display: none; }
+         .list-header .size-col, .list-view .size-col,
+         .list-header .date-col, .list-view .date-col,
+         .list-header .category-col, .list-view .category-col,
+         .list-header .remark-col, .list-view .remark-col { display: none; }
       }
     </style>
   </head>
@@ -3641,7 +3682,6 @@ function generateAdminPage(fileCards, categoryOptions) {
       let searchTimeout;
 
       document.addEventListener('DOMContentLoaded', function() {
-        // Element caching
         const searchInput = document.getElementById('search-input');
         const categoryFilter = document.getElementById('category-filter');
         const selectAllBtn = document.getElementById('selectAllBtn');
@@ -3656,7 +3696,6 @@ function generateAdminPage(fileCards, categoryOptions) {
         const listViewBtn = document.getElementById('list-view-btn');
         const gridViewBtn = document.getElementById('grid-view-btn');
 
-        // Event listeners
         searchInput.addEventListener('input', () => {
             clearTimeout(searchTimeout);
             searchTimeout = setTimeout(() => filterFiles(true), 300);
@@ -3693,26 +3732,21 @@ function generateAdminPage(fileCards, categoryOptions) {
               listHeader.style.display = 'grid';
               listViewBtn.classList.add('active');
               gridViewBtn.classList.remove('active');
-              // This is needed to re-apply the correct display for visible cards
-              filterFiles();
           } else {
               fileGrid.className = 'grid-view';
               listHeader.style.display = 'none';
               gridViewBtn.classList.add('active');
               listViewBtn.classList.remove('active');
-              // Re-apply display for grid mode
-              document.querySelectorAll('.file-card').forEach(card => {
-                if (card.style.display !== 'none') card.style.display = 'flex';
-              });
           }
           localStorage.setItem('fileViewMode', mode);
+          filterFiles();
       }
 
       function loadViewMode() {
           setViewMode(localStorage.getItem('fileViewMode') || 'grid');
       }
 
-      function filterFiles(isSearch = false) {
+      function filterFiles() {
           const searchTerm = document.getElementById('search-input').value.toLowerCase();
           const selectedCategory = document.getElementById('category-filter').value;
           const isListView = document.getElementById('fileGrid').classList.contains('list-view');
@@ -3761,19 +3795,13 @@ function generateAdminPage(fileCards, categoryOptions) {
       }
 
       function getSelectedFileUrls() {
-        const selectedCheckboxes = document.querySelectorAll('.file-checkbox:checked');
-        if (selectedCheckboxes.length === 0) {
-            showConfirmModal('请先选择文件！', null, true);
-            return [];
-        }
-        return Array.from(selectedCheckboxes).map(cb => cb.value);
+        return Array.from(document.querySelectorAll('.file-checkbox:checked')).map(cb => cb.value);
       }
 
       function confirmDeleteSelected() {
         const urls = getSelectedFileUrls();
-        if (urls.length > 0) {
-            showConfirmModal(\`确定要删除选中的 \${urls.length} 个文件吗？\`, () => deleteSelectedFiles(urls));
-        }
+        if (urls.length === 0) return showConfirmModal('请先选择文件！', null, true);
+        showConfirmModal(\`确定要删除选中的 \${urls.length} 个文件吗？\`, () => deleteSelectedFiles(urls));
       }
 
       async function deleteSelectedFiles(urls) {
@@ -3815,7 +3843,7 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       function showRemarkModal() {
         const urls = getSelectedFileUrls();
-        if (urls.length === 0) return;
+        if (urls.length === 0) return showConfirmModal('请先选择文件！', null, true);
         document.getElementById('remarkInput').value = '';
         document.getElementById('remarkModal').classList.add('show');
       }
@@ -3852,7 +3880,7 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       function confirmChangeCategory() {
         const urls = getSelectedFileUrls();
-        if (urls.length === 0) return;
+        if (urls.length === 0) return showConfirmModal('请先选择文件！', null, true);
         const categorySelect = document.getElementById('moveToCategorySelect');
         const categoryId = categorySelect.value;
         if (categoryId === "") return showConfirmModal('请选择一个目标分类！', null, true);
@@ -4078,9 +4106,13 @@ function generateNewUrl(url, suffix, config) {
   return `https://${config.domain}/${newFileName}`;
 }
 function getFileName(url) {
-  const urlObj = new URL(url);
-  const pathParts = urlObj.pathname.split('/');
-  return pathParts[pathParts.length - 1];
+  try {
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/');
+    return pathParts[pathParts.length - 1];
+  } catch(e) {
+    return url.split('/').pop() || url;
+  }
 }
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text)

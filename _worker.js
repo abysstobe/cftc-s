@@ -559,40 +559,54 @@ export default {
     return await handleFileRequest(request, config);
   }
 };
+
+async function deleteMessage(chatId, messageId, botToken) {
+    if (!botToken || !chatId || !messageId) return;
+    try {
+        await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+        });
+        console.log(`[Auto-Delete] Deleted message ${messageId} from chat ${chatId}`);
+    } catch (e) {
+        console.error(`[Auto-Delete] Failed to delete message ${messageId}: ${e.message}`);
+    }
+}
+
 async function handleTelegramWebhook(request, config) {
   try {
     const update = await request.json();
     let chatId;
     let userId;
+    let message;
+
     if (update.message) {
-      chatId = update.message.chat.id.toString();
-      userId = update.message.from.id.toString();
+      message = update.message;
+      chatId = message.chat.id.toString();
+      userId = message.from.id.toString();
       console.log(`[Webhook] Received message from chat ID: ${chatId}, User ID: ${userId}`);
-      // --- Ignore group/supergroup messages ---
-      if (update.message.chat.type === 'group' || update.message.chat.type === 'supergroup') {
-        console.log(`[Webhook] Ignoring message from group/supergroup chat ID: ${chatId}`);
-        return new Response('OK');
-      }
-      // --------------------------------------
     } else if (update.callback_query) {
-      chatId = update.callback_query.from.id.toString();
+      message = update.callback_query.message;
+      chatId = message.chat.id.toString(); 
       userId = update.callback_query.from.id.toString();
       console.log(`[Webhook] Received callback_query from chat ID: ${chatId}, User ID: ${userId}`);
     } else {
       console.log('[Webhook] Received update without message or callback_query:', JSON.stringify(update));
       return new Response('OK');
     }
-    // Check if the chatId is included in the allowed list
-    if (config.tgChatId && config.tgChatId.length > 0 && !config.tgChatId.includes(chatId)) {
-      console.log(`[Auth Check] FAILED: Chat ID ${chatId} (User ID: ${userId}) is not in the allowed list [${config.tgChatId.join(', ')}]. Ignoring update.`);
-      if (config.tgBotToken) {
-         await sendMessage(chatId, "你无权使用 请联系管理员授权", config.tgBotToken);
-      } else {
-         console.warn("[Auth Check] Cannot send unauthorized message: TG_BOT_TOKEN not configured.")
-      }
+
+    // --- FIX #2: BOT GIVES NO RESPONSE TO UNAUTHORIZED USERS ---
+    // Check if the USER ID is included in the allowed list.
+    if (config.tgChatId && config.tgChatId.length > 0 && !config.tgChatId.includes(userId)) {
+      console.log(`[Auth Check] FAILED: User ID ${userId} (from Chat ID: ${chatId}) is not in the allowed list [${config.tgChatId.join(', ')}]. Ignoring update.`);
+      // Return immediately without sending any message.
       return new Response('OK');
     }
-    console.log(`[Auth Check] PASSED: Chat ID ${chatId} (User ID: ${userId}) is allowed.`);
+    
+    console.log(`[Auth Check] PASSED: User ID ${userId} (from Chat ID: ${chatId}) is allowed.`);
+    
+    // The logic to initialize user settings for the chat
     let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
     if (!userSetting) {
       let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
@@ -610,12 +624,160 @@ async function handleTelegramWebhook(request, config) {
       } else {
           defaultCategoryId = defaultCategory.id;
       }
+      // Default storage type for new chats is R2, as in the original code
       await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, current_category_id) VALUES (?, ?, ?)')
          .bind(chatId, 'r2', defaultCategoryId).run();
       userSetting = { chat_id: chatId, storage_type: 'r2', current_category_id: defaultCategoryId };
     }
+    
     if (update.message) {
-      if (userSetting.waiting_for === 'new_category' && update.message.text) {
+        const messageText = (update.message.text || '').trim();
+        const commandRegex = /^\/(\w+)(?:@\w+)?(?:\s+(.*))?$/;
+        const match = messageText.match(commandRegex);
+
+        if (match) {
+            const command = match[1];
+            const args = match[2] ? match[2].trim() : '';
+            const replyToMessage = update.message.reply_to_message;
+
+            switch (command) {
+                case 'start':
+                    await sendPanel(chatId, userSetting, config);
+                    await deleteMessage(chatId, update.message.message_id, config.tgBotToken);
+                    return new Response('OK');
+
+                case 'get':
+                    if (!replyToMessage) {
+                        await sendMessage(chatId, "⚠️ 使用 /get 命令时，请回复一个文件。", config.tgBotToken);
+                        return new Response('OK');
+                    }
+                    const fileForGet = await config.database.prepare(
+                        'SELECT url FROM files WHERE message_id = ?'
+                    ).bind(replyToMessage.message_id).first();
+
+                    if (fileForGet) {
+                        await sendMessage(chatId, `✅ 获取成功！\n下载直链： ${fileForGet.url}`, config.tgBotToken, update.message.message_id);
+                    } else {
+                        await sendMessage(chatId, "⚠️ 未在数据库中找到此文件的记录。", config.tgBotToken, update.message.message_id);
+                    }
+                     await deleteMessage(chatId, update.message.message_id, config.tgBotToken);
+                    return new Response('OK');
+
+                // --- FIX #1: REWRITE /del COMMAND LOGIC ---
+                case 'del':
+                    if (!replyToMessage) {
+                        await sendMessage(chatId, "⚠️ 使用 /del 命令时，请回复一个文件消息。", config.tgBotToken);
+                        return new Response('OK');
+                    }
+
+                    // Try to find the file by parsing the URL from the replied message's text first.
+                    // This is more robust as users often reply to the bot's success message.
+                    let fileToDelete = null;
+                    if (replyToMessage.text) {
+                        const urlRegex = /(https?:\/\/[^\s]+)/;
+                        const urlMatch = replyToMessage.text.match(urlRegex);
+                        if (urlMatch && urlMatch[0]) {
+                            fileToDelete = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlMatch[0]).first();
+                        }
+                    }
+
+                    // If not found, try the old way (by message_id, for replying to the original file message).
+                    if (!fileToDelete) {
+                       fileToDelete = await config.database.prepare('SELECT * FROM files WHERE message_id = ?').bind(replyToMessage.message_id).first();
+                    }
+
+                    if (!fileToDelete) {
+                        await sendMessage(chatId, "⚠️ 未在数据库中找到此文件的记录，无法删除。请回复机器人发送的【文件上传成功】消息。", config.tgBotToken, update.message.message_id);
+                        await deleteMessage(chatId, update.message.message_id, config.tgBotToken);
+                        return new Response('OK');
+                    }
+                    
+                    try {
+                        // Inlined deletion logic starts here
+                        console.log('准备通过 /del 删除文件:', { fileId: fileToDelete.fileId, url: fileToDelete.url, storageType: fileToDelete.storage_type });
+
+                        if (fileToDelete.storage_type === 'r2' && config.bucket && fileToDelete.fileId) {
+                            await config.bucket.delete(fileToDelete.fileId);
+                            console.log('已从R2存储中删除文件:', fileToDelete.fileId);
+                        } else if (fileToDelete.storage_type === 'telegram' && fileToDelete.message_id && fileToDelete.message_id > 0) {
+                             const deleteTgMsgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${fileToDelete.message_id}`);
+                             const deleteTgMsgResult = await deleteTgMsgResponse.json();
+                             if (deleteTgMsgResult.ok) {
+                                 console.log(`已从Telegram删除消息: ${fileToDelete.message_id}`);
+                             } else {
+                                 console.warn(`从Telegram删除消息失败 (可能已被删除): ${deleteTgMsgResult.description}`);
+                             }
+                        }
+
+                        await config.database.prepare('DELETE FROM files WHERE id = ?').bind(fileToDelete.id).run();
+                        console.log('已从数据库中删除文件记录');
+
+                        const cacheKey = `file:${getFileName(fileToDelete.url)}`;
+                        if (config.fileCache && config.fileCache.has(cacheKey)) {
+                            config.fileCache.delete(cacheKey);
+                            console.log(`已清除文件缓存: ${cacheKey}`);
+                        }
+                        // Inlined deletion logic ends here
+                        
+                        await sendMessage(chatId, `✅ 文件 "${fileToDelete.file_name || getFileName(fileToDelete.url)}" 已成功删除。`, config.tgBotToken);
+                    
+                    } catch (e) {
+                        console.error(`[/del command] 删除文件时出错:`, e);
+                        await sendMessage(chatId, `❌ 删除文件时出错: ${e.message}`, config.tgBotToken);
+                    }
+                    // Delete the user's /del command message
+                    await deleteMessage(chatId, update.message.message_id, config.tgBotToken);
+                    return new Response('OK');
+
+                case 'name':
+                     if (!replyToMessage) {
+                        await sendMessage(chatId, "⚠️ 使用 /name 命令时，请回复一个文件。", config.tgBotToken);
+                        return new Response('OK');
+                    }
+                    const fileToRename = await config.database.prepare(
+                        'SELECT * FROM files WHERE message_id = ?'
+                    ).bind(replyToMessage.message_id).first();
+
+                    if (!fileToRename) {
+                        await sendMessage(chatId, "⚠️ 未在数据库中找到此文件的记录，无法重命名。", config.tgBotToken, update.message.message_id);
+                        return new Response('OK');
+                    }
+                    
+                    await config.database.prepare('UPDATE user_settings SET waiting_for = ?, editing_file_id = ? WHERE chat_id = ?')
+                      .bind('rename_from_command', fileToRename.id, chatId).run();
+                    
+                    await sendMessage(chatId, `📝 请回复此消息，输入文件的新名称（不含扩展名）`, config.tgBotToken, update.message.message_id);
+                    await deleteMessage(chatId, update.message.message_id, config.tgBotToken);
+                    return new Response('OK');
+
+            }
+        }
+      if (userSetting.waiting_for === 'rename_from_command' && messageText && userSetting.editing_file_id) {
+            const newSuffix = messageText;
+            const fileId = userSetting.editing_file_id;
+            try {
+                const file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(fileId).first();
+                if (!file) {
+                    await sendMessage(chatId, "⚠️ 文件不存在或已被删除", config.tgBotToken);
+                } else {
+                    const response = await handleUpdateSuffixRequest({
+                        json: async () => ({ url: file.url, suffix: newSuffix })
+                    }, config);
+                    const result = await response.json();
+                    if (result.status === 1) {
+                         await sendMessage(chatId, `✅ 重命名成功！\n\n新链接：${result.newUrl}`, config.tgBotToken);
+                    } else {
+                        await sendMessage(chatId, `❌ 重命名失败: ${result.msg}`, config.tgBotToken);
+                    }
+                }
+            } catch(error) {
+                console.error('重命名失败:', error);
+                await sendMessage(chatId, `❌ 重命名失败: ${error.message}`, config.tgBotToken);
+            }
+            await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
+            return new Response('OK');
+      }
+      else if (userSetting.waiting_for === 'new_category' && update.message.text) {
         const categoryName = update.message.text.trim();
         try {
           const existingCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind(categoryName).first();
@@ -628,7 +790,7 @@ async function handleTelegramWebhook(request, config) {
             await config.database.prepare('UPDATE user_settings SET current_category_id = ?, waiting_for = NULL WHERE chat_id = ?').bind(newCategory.id, chatId).run();
             await sendMessage(chatId, `✅ 分类"${categoryName}"创建成功并已设为当前分类`, config.tgBotToken);
           }
-  } catch (error) {
+        } catch (error) {
           console.error('创建分类失败:', error);
           await sendMessage(chatId, `❌ 创建分类失败: ${error.message}`, config.tgBotToken);
         }
@@ -780,9 +942,6 @@ async function handleTelegramWebhook(request, config) {
           return new Response('OK');
         }
       }
-      if (update.message.text === '/start') {
-        await sendPanel(chatId, userSetting, config);
-      }
       else if (update.message.photo || update.message.document || update.message.video || update.message.audio || update.message.voice || update.message.video_note) {
         console.log('收到文件上传:', JSON.stringify({
           hasPhoto: !!update.message.photo,
@@ -814,7 +973,7 @@ async function handleTelegramWebhook(request, config) {
           isDocument = false;
         }
         if (file) {
-          await handleMediaUpload(chatId, file, isDocument, config, userSetting);
+          await handleMediaUpload(chatId, file, isDocument, config, userSetting, update.message.message_id);
         } else {
           await sendMessage(chatId, "❌ 无法识别的文件类型", config.tgBotToken);
         }
@@ -830,7 +989,7 @@ async function handleTelegramWebhook(request, config) {
         }
         if (fileField) {
           console.log(`找到未明确处理的文件类型: ${fileField}`, JSON.stringify(message[fileField]));
-          await handleMediaUpload(chatId, message[fileField], true, config, userSetting);
+          await handleMediaUpload(chatId, message[fileField], true, config, userSetting, update.message.message_id);
         } else if (userSetting.waiting_for === 'edit_suffix_input_file' && message.text) {
           try {
             const userInput = message.text.trim();
@@ -948,7 +1107,7 @@ async function handleTelegramWebhook(request, config) {
           userSetting.editing_file_id = null;
           await sendPanel(chatId, userSetting, config);
           return new Response('OK');
-        } else if (message.text && message.text !== '/start') {
+        } else if (message.text && !match) { // If it's text but not a command we handled
           await sendMessage(chatId, "请发送图片或文件进行上传，或使用 /start 查看主菜单", config.tgBotToken);
         }
       }
@@ -1075,25 +1234,32 @@ function getKeyboardLayout(userSetting) {
         { text: "📂 最近文件", callback_data: "recent_files" },
         { text: "✏️ 重命名", callback_data: "edit_suffix_input" },
         { text: "🗑️ 删除文件", callback_data: "delete_file_input" }
-      ],
-      [
-        { text: "📦 本项目GitHub地址", url: "https://github.com/iawooo/cftc" }
       ]
     ]
   };
 }
+// --- FIX #3: REWRITE handleCallbackQuery LOGIC ---
 async function handleCallbackQuery(update, config, userSetting) {
-  const chatId = update.callback_query.from.id.toString();
-  const cbData = update.callback_query.data;
+  const query = update.callback_query;
+  const originalMessage = query.message;
+  
+  // Use the correct chat ID from the message where the button was pressed
+  const chatId = originalMessage.chat.id.toString();
+  const messageId = originalMessage.message_id;
+  const userId = query.from.id.toString(); // The user who clicked the button
+  const cbData = query.data;
+
+  // Acknowledge the button press to remove the loading animation on the user's client
   const answerPromise = fetch(`https://api.telegram.org/bot${config.tgBotToken}/answerCallbackQuery`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: update.callback_query.id })
+    body: JSON.stringify({ callback_query_id: query.id })
   }).catch(error => {
     console.error('确认回调查询失败:', error);
   });
+  
   try {
-    if (userSetting.waiting_for && !cbData.startsWith('delete_file_do_')) {
+     if (userSetting.waiting_for && !cbData.startsWith('delete_file_do_')) {
        if (!(userSetting.waiting_for === 'new_suffix' && cbData.startsWith('edit_suffix_file_')) &&
            !(userSetting.waiting_for === 'new_category' && cbData === 'create_category') &&
            !(userSetting.waiting_for === 'delete_file_input' && cbData === 'delete_file_input') &&
@@ -1105,186 +1271,126 @@ async function handleCallbackQuery(update, config, userSetting) {
            userSetting.editing_file_id = null;
        }
     }
-    const cacheKey = `button:${chatId}:${cbData}`;
-    if (config.buttonCache && config.buttonCache.has(cacheKey) && !cbData.startsWith('delete_file_confirm_') && !cbData.startsWith('delete_file_do_') ) {
-      const cachedData = config.buttonCache.get(cacheKey);
-      if (Date.now() - cachedData.timestamp < config.buttonCacheTTL) {
-        console.log(`使用缓存的按钮响应: ${cacheKey}`);
-        await answerPromise;
-        if (cachedData.responseText) {
-          await sendMessage(chatId, cachedData.responseText, config.tgBotToken);
-        }
-        if (cachedData.sendPanel) {
-          await sendPanel(chatId, userSetting, config);
-        }
-        if (cachedData.replyMarkup) {
-          await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              text: cachedData.replyText,
-              reply_markup: cachedData.replyMarkup,
-              parse_mode: 'HTML',
-              disable_web_page_preview: cachedData.disablePreview || false
-            })
-          });
-        }
-        return;
-      } else {
-        config.buttonCache.delete(cacheKey);
-      }
-    }
+
     if (cbData === 'switch_storage') {
       const newStorageType = userSetting.storage_type === 'r2' ? 'telegram' : 'r2';
-      await Promise.all([
-        config.database.prepare('UPDATE user_settings SET storage_type = ? WHERE chat_id = ?')
-          .bind(newStorageType, chatId).run(),
-        answerPromise
-      ]);
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          sendPanel: true
-        });
-      }
-      await sendPanel(chatId, { ...userSetting, storage_type: newStorageType }, config);
+      await config.database.prepare('UPDATE user_settings SET storage_type = ? WHERE chat_id = ?')
+          .bind(newStorageType, chatId).run();
+      
+      await answerPromise; // Ensure acknowledgement is sent
+
+      // Fetch the updated settings and regenerate the main menu
+      const updatedUserSetting = { ...userSetting, storage_type: newStorageType };
+      const { messageBody, keyboard } = await generateMainMenu(chatId, updatedUserSetting, config);
+
+      // Edit the original message to show the updated panel
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: messageBody,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        })
+      });
     }
     else if (cbData === 'list_categories') {
-      const categoriesPromise = config.database.prepare('SELECT id, name FROM categories').all();
       await answerPromise;
-      const categories = await categoriesPromise;
+      const categories = await config.database.prepare('SELECT id, name FROM categories').all();
       if (!categories.results || categories.results.length === 0) {
         await sendMessage(chatId, "⚠️ 暂无分类，请先创建分类", config.tgBotToken);
         return;
       }
-      const categoriesText = categories.results.map((cat, i) =>
-        `${i + 1}. ${cat.name}`
-      ).join('\n');
+      const categoriesText = "📂 请选择要使用的分类：";
       const keyboard = {
         inline_keyboard: categories.results.map(cat => [
           { text: cat.name, callback_data: `set_category_${cat.id}` }
         ]).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
       };
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          replyText: "📂 请选择要使用的分类：\n\n" + categoriesText,
-          replyMarkup: keyboard
-        });
-      }
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      // Edit the message to show category list
+       await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "📂 请选择要使用的分类：\n\n" + categoriesText,
+          message_id: messageId,
+          text: categoriesText,
           reply_markup: keyboard
         })
       });
     }
     else if (cbData === 'create_category') {
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          responseText: "📝 请回复此消息，输入新分类名称"
-        });
-      }
-      await Promise.all([
-        answerPromise,
-        sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken),
-        config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
-          .bind('new_category', chatId).run()
-      ]);
+      await answerPromise;
+      await sendMessage(chatId, "📝 请回复此消息，输入新分类名称", config.tgBotToken);
+      await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
+          .bind('new_category', chatId).run();
       userSetting.waiting_for = 'new_category';
     }
     else if (cbData.startsWith('set_category_')) {
       const categoryId = parseInt(cbData.split('_')[2]);
-      const updatePromise = config.database.prepare(
+      await config.database.prepare(
         'UPDATE user_settings SET current_category_id = ? WHERE chat_id = ?'
       ).bind(categoryId, chatId).run();
-      const categoryPromise = config.database.prepare(
-        'SELECT name FROM categories WHERE id = ?'
-      ).bind(categoryId).first();
+      
       await answerPromise;
-      const [_, category] = await Promise.all([updatePromise, categoryPromise]);
-      const responseText = `✅ 已切换到分类: ${category?.name || '未知分类'}`;
-      if (config.buttonCache) {
-        config.buttonCache.set(`button:${chatId}:${cbData}`, {
-          timestamp: Date.now(),
-          responseText,
-          sendPanel: true
-        });
-      }
-      await sendMessage(chatId, responseText, config.tgBotToken);
-      await sendPanel(chatId, { ...userSetting, current_category_id: categoryId }, config);
+      
+      // After setting category, show the main panel again by editing the message
+      const updatedUserSetting = { ...userSetting, current_category_id: categoryId };
+      const { messageBody, keyboard } = await generateMainMenu(chatId, updatedUserSetting, config);
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: messageBody,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        })
+      });
     }
     else if (cbData === 'back_to_panel') {
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          sendPanel: true
-        });
-      }
       await answerPromise;
       if (userSetting.waiting_for) {
         await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
         userSetting.waiting_for = null;
         userSetting.editing_file_id = null;
       }
-      await sendPanel(chatId, userSetting, config);
+      
+      // Regenerate and edit the message to show the main panel
+      const { messageBody, keyboard } = await generateMainMenu(chatId, userSetting, config);
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: messageBody,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        })
+      });
     }
     else if (cbData === 'r2_stats') {
-      const statsPromise = config.database.prepare(`
+      const stats = await config.database.prepare(`
         SELECT COUNT(*) as total_files,
                SUM(file_size) as total_size
         FROM files WHERE chat_id = ? AND storage_type = 'r2'
       `).bind(chatId).first();
       await answerPromise;
-      const stats = await statsPromise;
+
       const statsMessage = `📊 您的 R2 存储使用统计
   ─────────────
   📁 R2 文件数: ${stats.total_files || 0}
   💾 R2 存储量: ${formatSize(stats.total_size || 0)}`;
-      if (config.buttonCache) {
-        config.buttonCache.set(cacheKey, {
-          timestamp: Date.now(),
-          responseText: statsMessage
-        });
-      }
-      await sendMessage(chatId, statsMessage, config.tgBotToken);
-    }
-    else if (cbData === 'edit_suffix') {
-      await answerPromise;
-      const recentFiles = await config.database.prepare(`
-        SELECT id, url, fileId, file_name, created_at, storage_type
-        FROM files
-        WHERE chat_id = ?
-        ORDER BY created_at DESC
-        LIMIT 5
-      `).bind(chatId).all();
-      if (!recentFiles.results || recentFiles.results.length === 0) {
-        await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
-        return;
-      }
-      const keyboard = {
-        inline_keyboard: recentFiles.results.map(file => {
-          const fileName = file.file_name || getFileName(file.url);
-          return [{ text: fileName, callback_data: `edit_suffix_file_${file.id}` }];
-        }).concat([[{ text: "« 返回", callback_data: "back_to_panel" }]])
-      };
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "📝 请选择要重命名的文件：",
-          reply_markup: keyboard
-        })
-      });
+      
+      // Send stats as a new message, but make it a reply to the panel
+      await sendMessage(chatId, statsMessage, config.tgBotToken, messageId);
     }
     else if (cbData === 'recent_files') {
-      const recentFilesPromise = config.database.prepare(`
+      const recentFiles = await config.database.prepare(`
         SELECT id, url, created_at, file_name, storage_type
         FROM files
         WHERE chat_id = ?
@@ -1292,7 +1398,7 @@ async function handleCallbackQuery(update, config, userSetting) {
         LIMIT 10
       `).bind(chatId).all();
       await answerPromise;
-      const recentFiles = await recentFilesPromise;
+
       if (!recentFiles.results || recentFiles.results.length === 0) {
         await sendMessage(chatId, "⚠️ 您还没有上传过文件", config.tgBotToken);
         return;
@@ -1303,24 +1409,15 @@ async function handleCallbackQuery(update, config, userSetting) {
         const storageEmoji = file.storage_type === 'r2' ? '☁️' : '✈️';
         return `${i + 1}. ${fileName}\n   📅 ${date} ${storageEmoji}\n   🔗 ${file.url}`;
       }).join('\n\n');
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: "« 返回", callback_data: "back_to_panel" }]
-        ]
-      };
-      if (config.buttonCache) {
-         config.buttonCache.set(cacheKey, {
-           timestamp: Date.now(),
-           replyText: "📋 您最近上传的文件：\n\n" + filesList,
-           replyMarkup: keyboard,
-           disablePreview: true
-         });
-      }
-      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
+      const keyboard = { inline_keyboard: [[{ text: "« 返回", callback_data: "back_to_panel" }]] };
+      
+      // Edit the panel to show recent files
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: chatId,
+          message_id: messageId,
           text: "📋 您最近上传的文件：\n\n" + filesList,
           reply_markup: keyboard,
           disable_web_page_preview: true
@@ -1341,27 +1438,14 @@ async function handleCallbackQuery(update, config, userSetting) {
       userSetting.waiting_for = 'delete_file_input';
       await sendMessage(chatId, "🗑️ 请回复此消息，输入要删除的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
     }
-    else if (cbData.startsWith('delete_file_confirm_')) {
-    }
-    else if (cbData.startsWith('delete_file_do_')) {
-    }
-    else if (userSetting.waiting_for === 'edit_suffix_input_file' && update.message.text) {
-      console.error('错误: 不应该执行到这里，重命名的逻辑已移至handleTelegramWebhook函数');
-      try { await answerPromise; } catch {}
-      return;
-    }
-    else if (userSetting.waiting_for === 'edit_suffix_input_new' && update.message.text && userSetting.editing_file_id) {
-      console.error('错误: 不应该执行到这里，重命名的逻辑已移至handleTelegramWebhook函数');
-      try { await answerPromise; } catch {}
-      return;
-    }
+    
   } catch (error) {
     console.error('处理回调查询时出错:', error);
-    try { await answerPromise; } catch {}
+    try { await answerPromise; } catch {} // Try to answer anyway to avoid client hanging
     await sendMessage(chatId, `❌ 处理请求时出错: ${error.message}`, config.tgBotToken);
   }
 }
-async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
+async function handleMediaUpload(chatId, file, isDocument, config, userSetting, originalMessageId) {
   const processingMessage = await sendMessage(chatId, "⏳ 正在处理您的文件，请稍候...", config.tgBotToken);
   const processingMessageId = processingMessage && processingMessage.result ? processingMessage.result.message_id : null;
   try {
@@ -1482,19 +1566,21 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       });
       finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
-      dbMessageId = -1;
+      dbMessageId = originalMessageId; // Store original message ID for reference
     } else {
       let method = 'sendDocument';
       let field = 'document';
       let messageId = null;
       let fileId = null;
-      if (mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
+      // In groups, always send as a document to avoid confusion
+      const isGroup = chatId.toString().startsWith('-');
+      if (!isGroup && mainType === 'image' && !['svg+xml', 'x-icon'].includes(subType)) {
         method = 'sendPhoto';
         field = 'photo';
-      } else if (mainType === 'video') {
+      } else if (!isGroup && mainType === 'video') {
         method = 'sendVideo';
         field = 'video';
-      } else if (mainType === 'audio') {
+      } else if (!isGroup && mainType === 'audio') {
         method = 'sendAudio';
         field = 'audio';
       } else {

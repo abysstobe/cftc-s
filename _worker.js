@@ -1987,88 +1987,72 @@ async function handleUploadRequest(request, config) {
   }
 }
 async function handleDeleteMultipleRequest(request, config) {
-  if (config.enableAuth && !authenticate(request, config)) {
-    return Response.redirect(`${new URL(request.url).origin}/`, 302);
-  }
-  try {
-    const { urls } = await request.json();
-    if (!Array.isArray(urls) || urls.length === 0) {
-      return new Response(JSON.stringify({
-        status: 0,
-        error: '无效的URL列表'
-      }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
+    if (config.enableAuth && !authenticate(request, config)) {
+        return new Response(JSON.stringify({ status: 0, msg: "未授权" }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' }
+        });
     }
-    const results = {
-      success: [],
-      failed: []
-    };
-    for (const url of urls) {
-      try {
-        const fileName = url.split('/').pop();
-        let file = await config.database.prepare(
-          'SELECT id, fileId, message_id, storage_type FROM files WHERE url = ?'
-        ).bind(url).first();
-        if (!file && fileName) {
-          file = await config.database.prepare(
-            'SELECT id, fileId, message_id, storage_type FROM files WHERE fileId = ?'
-          ).bind(fileName).first();
+    try {
+        const { urls } = await request.json();
+        if (!Array.isArray(urls) || urls.length === 0) {
+            return new Response(JSON.stringify({ status: 0, error: '无效的URL列表' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
         }
-        if (file) {
-          console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
-          if (file.storage_type === 'telegram' && file.message_id) {
+        const results = { success: [], failed: [] };
+        for (const url of urls) {
             try {
-              await fetch(
-                `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
-              );
-              console.log(`已从Telegram删除消息: ${file.message_id}`);
+                const file = await config.database.prepare('SELECT id, fileId, message_id, storage_type, url FROM files WHERE url = ?').bind(url).first();
+
+                if (file) {
+                    console.log(`正在删除文件: ${url}, 存储类型: ${file.storage_type}`);
+
+                    if (file.storage_type === 'telegram' && file.message_id && file.message_id > 0) {
+                        try {
+                            const tgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`);
+                            const tgResult = await tgResponse.json();
+                            if (tgResult.ok) {
+                                console.log(`已从Telegram删除消息: ${file.message_id}`);
+                            } else {
+                                console.warn(`从Telegram删除消息失败 (可能已被删除): ${tgResult.description}`);
+                            }
+                        } catch (error) {
+                            console.error(`从Telegram删除消息时出错: ${error.message}`);
+                        }
+                    } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
+                        try {
+                            await config.bucket.delete(file.fileId);
+                            console.log(`已从R2删除文件: ${file.fileId}`);
+                        } catch (error) {
+                            console.error(`从R2删除文件失败: ${error.message}`);
+                        }
+                    }
+                    await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+                    console.log(`已从数据库删除记录: ID=${file.id}`);
+                    results.success.push(url);
+                } else {
+                    console.log(`未找到文件记录: ${url}`);
+                    results.failed.push({ url, reason: '未找到文件记录' });
+                }
             } catch (error) {
-              console.error(`从Telegram删除消息失败: ${error.message}`);
+                console.error(`删除文件失败 ${url}: ${error.message}`);
+                results.failed.push({ url, reason: error.message });
             }
-          } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
-            try {
-              await config.bucket.delete(file.fileId);
-              console.log(`已从R2删除文件: ${file.fileId}`);
-            } catch (error) {
-              console.error(`从R2删除文件失败: ${error.message}`);
-            }
-          }
-          await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-          console.log(`已从数据库删除记录: ID=${file.id}`);
-          results.success.push(url);
-        } else {
-          console.log(`未找到文件记录: ${url}`);
-          results.failed.push({url, reason: '未找到文件记录'});
         }
-      } catch (error) {
-        console.error(`删除文件失败 ${url}: ${error.message}`);
-        results.failed.push({url, reason: error.message});
-      }
+        return new Response(JSON.stringify({
+            status: 1,
+            message: '批量删除处理完成',
+            results: { success: results.success.length, failed: results.failed.length, details: results }
+        }), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+        console.error(`[Delete Multiple Error] ${error.message}`);
+        return new Response(JSON.stringify({ status: 0, error: error.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
     }
-    return new Response(
-      JSON.stringify({
-        status: 1,
-        message: '批量删除处理完成',
-        results: {
-          success: results.success.length,
-          failed: results.failed.length,
-          details: results
-        }
-      }),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error(`[Delete Multiple Error] ${error.message}`);
-    return new Response(
-      JSON.stringify({
-        status: 0,
-        error: error.message
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
 }
 async function handleAdminRequest(request, config) {
   if (config.enableAuth && !authenticate(request, config)) {
@@ -2327,62 +2311,78 @@ async function handleFileRequest(request, config) {
   }
 }
 async function handleDeleteRequest(request, config) {
-  if (config.enableAuth && !authenticate(request, config)) {
-    return Response.redirect(`${new URL(request.url).origin}/`, 302);
-  }
-  try {
-    const { id, fileId } = await request.json();
-    if (!id && !fileId) {
-      return new Response(JSON.stringify({
-        status: 0,
-        message: '缺少文件标识信息'
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+    if (config.enableAuth && !authenticate(request, config)) {
+        return new Response(JSON.stringify({ status: 0, msg: "未授权" }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' }
+        });
     }
-    let file;
-    if (id && id.startsWith('http')) {
-      file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(id).first();
-    } else if (id) {
-      file = await config.database.prepare('SELECT * FROM files WHERE id = ?').bind(id).first();
+    try {
+        const { id } = await request.json(); // The URL is passed as 'id' from the frontend
+        if (!id) {
+            return new Response(JSON.stringify({ status: 0, message: '缺少文件标识信息 (url)' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(id).first();
+
+        if (!file) {
+            return new Response(JSON.stringify({ status: 0, message: '文件不存在' }), {
+                status: 404,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        console.log('准备删除文件:', { fileId: file.fileId, url: file.url, storageType: file.storage_type });
+
+        // Delete from storage (R2 or Telegram)
+        if (file.storage_type === 'r2' && config.bucket && file.fileId) {
+            try {
+                await config.bucket.delete(file.fileId);
+                console.log('已从R2存储中删除文件:', file.fileId);
+            } catch (r2Error) {
+                console.error(`从R2删除文件失败: ${r2Error.message}`);
+                // Continue to delete from DB anyway
+            }
+        } else if (file.storage_type === 'telegram' && file.message_id && file.message_id > 0) {
+            try {
+                const tgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`);
+                const tgResult = await tgResponse.json();
+                if (tgResult.ok) {
+                    console.log(`已从Telegram删除消息: ${file.message_id}`);
+                } else {
+                    // Log error but don't stop the process, the message might be already deleted
+                    console.warn(`从Telegram删除消息失败 (可能已被删除): ${tgResult.description}`);
+                }
+            } catch (tgError) {
+                console.error(`从Telegram删除消息时出错: ${tgError.message}`);
+            }
+        }
+
+        // Delete from database
+        await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
+        console.log('已从数据库中删除文件记录');
+
+        // Clear cache
+        const cacheKey = `file:${getFileName(file.url)}`;
+        if (config.fileCache && config.fileCache.has(cacheKey)) {
+            config.fileCache.delete(cacheKey);
+            console.log(`已清除文件缓存: ${cacheKey}`);
+        }
+
+        return new Response(JSON.stringify({ status: 1, message: '删除成功' }), {
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('删除文件失败:', error);
+        return new Response(JSON.stringify({ status: 0, message: '删除文件失败: ' + error.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
     }
-    if (!file && fileId) {
-      file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(fileId).first();
-    }
-    if (!file) {
-      return new Response(JSON.stringify({
-        status: 0,
-        message: '文件不存在'
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-    console.log('准备删除文件:', {
-      fileId: file.fileId,
-      url: file.url,
-      存储类型: file.storage_type
-    });
-    if (file.storage_type === 'r2' && config.bucket) {
-      await deleteFile(file.fileId, config);
-      console.log('已从R2存储中删除文件:', file.fileId);
-    }
-    await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
-    console.log('已从数据库中删除文件记录');
-    return new Response(JSON.stringify({
-      status: 1,
-      message: '删除成功'
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    console.error('删除文件失败:', error);
-    return new Response(JSON.stringify({
-      status: 0,
-      message: '删除文件失败: ' + error.message
-    }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
 }
 function getContentType(ext) {
   const types = {
@@ -3968,7 +3968,6 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       async function updateFileSuffix() {
         const newSuffix = document.getElementById('editSuffixInput').value;
-        // BUG 2 FIX: Hide the modal immediately.
         document.getElementById('editSuffixModal').classList.remove('show');
         try {
           const response = await fetch('/update-suffix', {
@@ -3977,7 +3976,6 @@ function generateAdminPage(fileCards, categoryOptions) {
             body: JSON.stringify({ url: currentEditUrl, suffix: newSuffix })
           });
           const data = await response.json();
-          // BUG 1 FIX: Use "重命名成功" instead of "后缀修改成功" in the message from backend
           showConfirmModal(data.msg, data.status === 1 ? () => window.location.reload() : null, true);
         } catch (error) {
           showConfirmModal('重命名时出错：' + error.message, null, true);
@@ -4075,7 +4073,6 @@ async function handleUpdateSuffixRequest(request, config) {
       新URL: fileUrl
     });
     if (fileRecord.storage_type === 'telegram') {
-      // BUG 3 FIX: Update both url and file_name for consistency
       await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
         .bind(fileUrl, newFileName, fileRecord.id).run();
       console.log('Telegram文件更新完成:', {
@@ -4094,7 +4091,6 @@ async function handleUpdateSuffixRequest(request, config) {
           const fileData = await file.arrayBuffer();
           await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
           await deleteFile(fileId, config);
-          // BUG 3 FIX: Update file_name here as well
           await config.database.prepare('UPDATE files SET fileId = ?, url = ?, file_name = ? WHERE id = ?')
             .bind(newFileName, fileUrl, newFileName, fileRecord.id).run();
           console.log('R2文件更新完成:', {
@@ -4105,26 +4101,22 @@ async function handleUpdateSuffixRequest(request, config) {
           });
         } else {
           console.log('R2中未找到文件，只更新数据库记录:', fileId);
-           // BUG 3 FIX: Update file_name here as well
           await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
             .bind(fileUrl, newFileName, fileRecord.id).run();
         }
       } catch (error) {
         console.error('处理R2文件重命名失败:', error);
-        // BUG 3 FIX: Update file_name here as well
         await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
           .bind(fileUrl, newFileName, fileRecord.id).run();
       }
     }
     else {
       console.log('未知存储类型，只更新数据库记录');
-      // BUG 3 FIX: Update file_name here as well
       await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
         .bind(fileUrl, newFileName, fileRecord.id).run();
     }
     return new Response(JSON.stringify({
       status: 1,
-      // BUG 1 FIX: Change message text
       msg: '重命名成功',
       newUrl: fileUrl
     }), { headers: { 'Content-Type': 'application/json' } });

@@ -690,14 +690,14 @@ async function handleTelegramWebhook(request, config) {
               success = true;
             }
             if (success) {
-              await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
+              await sendMessage(chatId, `✅ 重命名成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
             } else {
-              await sendMessage(chatId, "❌ 后缀修改失败，请稍后重试", config.tgBotToken);
+              await sendMessage(chatId, "❌ 重命名失败，请稍后重试", config.tgBotToken);
             }
           }
         } catch (error) {
-          console.error('修改后缀失败:', error);
-          await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
+          console.error('重命名失败:', error);
+          await sendMessage(chatId, `❌ 重命名失败: ${error.message}`, config.tgBotToken);
         }
         await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
         userSetting.waiting_for = null;
@@ -873,12 +873,12 @@ async function handleTelegramWebhook(request, config) {
             userSetting.editing_file_id = fileToEdit.id;
             await sendMessage(
               chatId,
-              `📝 找到文件: ${fileName}\n当前后缀: ${currentSuffix}\n\n请回复此消息，输入文件的新后缀（不含扩展名）`,
+              `📝 找到文件: ${fileName}\n当前名称: ${currentSuffix}\n\n请回复此消息，输入文件的新名称（不含扩展名）`,
               config.tgBotToken
             );
             return new Response('OK');
           } catch (error) {
-            console.error('处理修改后缀文件选择失败:', error);
+            console.error('处理重命名文件选择失败:', error);
             await sendMessage(chatId, `❌ 处理失败: ${error.message}`, config.tgBotToken);
             await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?')
               .bind(chatId).run();
@@ -901,8 +901,8 @@ async function handleTelegramWebhook(request, config) {
               const fileUrl = `https://${config.domain}/${newFileName}`;
               let success = false;
               if (file.storage_type === 'telegram') {
-                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                  .bind(fileUrl, file.id).run();
+                await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+                  .bind(fileUrl, newFileName, file.id).run();
                 success = true;
               }
               else if (file.storage_type === 'r2' && config.bucket) {
@@ -913,35 +913,35 @@ async function handleTelegramWebhook(request, config) {
                     const fileData = await r2File.arrayBuffer();
                     await storeFile(fileData, newFileName, r2File.httpMetadata.contentType, config);
                     await deleteFile(fileId, config);
-                    await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-                      .bind(newFileName, fileUrl, file.id).run();
+                    await config.database.prepare('UPDATE files SET fileId = ?, url = ?, file_name = ? WHERE id = ?')
+                      .bind(newFileName, fileUrl, newFileName, file.id).run();
                     success = true;
                   } else {
-                    await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                      .bind(fileUrl, file.id).run();
+                    await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+                      .bind(fileUrl, newFileName, file.id).run();
                     success = true;
                   }
                 } catch (error) {
                   console.error('处理R2文件重命名失败:', error);
-                  await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                    .bind(fileUrl, file.id).run();
+                  await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+                    .bind(fileUrl, newFileName, file.id).run();
                   success = true;
                 }
               }
               else {
-                await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-                  .bind(fileUrl, file.id).run();
+                await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+                  .bind(fileUrl, newFileName, file.id).run();
                 success = true;
               }
               if (success) {
-                await sendMessage(chatId, `✅ 后缀修改成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
+                await sendMessage(chatId, `✅ 重命名成功！\n\n新链接：${fileUrl}`, config.tgBotToken);
               } else {
-                await sendMessage(chatId, "❌ 后缀修改失败，请稍后重试", config.tgBotToken);
+                await sendMessage(chatId, "❌ 重命名失败，请稍后重试", config.tgBotToken);
               }
             }
           } catch (error) {
-            console.error('修改后缀失败:', error);
-            await sendMessage(chatId, `❌ 修改后缀失败: ${error.message}`, config.tgBotToken);
+            console.error('重命名失败:', error);
+            await sendMessage(chatId, `❌ 重命名失败: ${error.message}`, config.tgBotToken);
           }
           await config.database.prepare('UPDATE user_settings SET waiting_for = NULL, editing_file_id = NULL WHERE chat_id = ?').bind(chatId).run();
           userSetting.waiting_for = null;
@@ -1073,7 +1073,7 @@ function getKeyboardLayout(userSetting) {
       ],
       [
         { text: "📂 最近文件", callback_data: "recent_files" },
-        { text: "✏️ 修改后缀", callback_data: "edit_suffix_input" },
+        { text: "✏️ 重命名", callback_data: "edit_suffix_input" },
         { text: "🗑️ 删除文件", callback_data: "delete_file_input" }
       ],
       [
@@ -1278,7 +1278,7 @@ async function handleCallbackQuery(update, config, userSetting) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: chatId,
-          text: "📝 请选择要修改后缀的文件：",
+          text: "📝 请选择要重命名的文件：",
           reply_markup: keyboard
         })
       });
@@ -1332,7 +1332,7 @@ async function handleCallbackQuery(update, config, userSetting) {
       await config.database.prepare('UPDATE user_settings SET waiting_for = ? WHERE chat_id = ?')
         .bind('edit_suffix_input_file', chatId).run();
       userSetting.waiting_for = 'edit_suffix_input_file';
-      await sendMessage(chatId, "✏️ 请回复此消息，输入要修改后缀的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
+      await sendMessage(chatId, "✏️ 请回复此消息，输入要重命名的文件完整名称（必须包含扩展名）或完整URL链接", config.tgBotToken);
     }
     else if (cbData === 'delete_file_input') {
       await answerPromise;
@@ -1346,12 +1346,12 @@ async function handleCallbackQuery(update, config, userSetting) {
     else if (cbData.startsWith('delete_file_do_')) {
     }
     else if (userSetting.waiting_for === 'edit_suffix_input_file' && update.message.text) {
-      console.error('错误: 不应该执行到这里，修改后缀的逻辑已移至handleTelegramWebhook函数');
+      console.error('错误: 不应该执行到这里，重命名的逻辑已移至handleTelegramWebhook函数');
       try { await answerPromise; } catch {}
       return;
     }
     else if (userSetting.waiting_for === 'edit_suffix_input_new' && update.message.text && userSetting.editing_file_id) {
-      console.error('错误: 不应该执行到这里，修改后缀的逻辑已移至handleTelegramWebhook函数');
+      console.error('错误: 不应该执行到这里，重命名的逻辑已移至handleTelegramWebhook函数');
       try { await answerPromise; } catch {}
       return;
     }
@@ -2116,7 +2116,7 @@ async function handleAdminRequest(request, config) {
             <div class="file-actions">
               <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
               <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-              <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">改后缀</button>
+              <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">重命名</button>
             </div>
           </div>
         `;
@@ -2178,7 +2178,7 @@ async function handleSearchRequest(request, config) {
                 <div class="file-actions">
                   <button class="btn btn-share" onclick="shareFile('${url}')">分享</button>
                   <button class="btn btn-delete" onclick="showConfirmModal('确定要删除这个文件吗？', () => deleteFile('${url}'))">删除</button>
-                  <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">改后缀</button>
+                  <button class="btn btn-edit" onclick="showEditSuffixModal('${url}')">重命名</button>
                 </div>
               </div>
             `;
@@ -3656,7 +3656,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       </div>
       <!-- Modals -->
       <div id="confirmModal" class="modal"><div class="modal-content"><h3 class="modal-title">确认操作</h3><p class="modal-message" id="confirmModalMessage"></p><div class="modal-buttons"><button class="modal-button modal-confirm" id="confirmModalConfirm">确认</button><button class="modal-button modal-cancel" id="confirmModalCancel">取消</button></div></div></div>
-      <div id="editSuffixModal" class="modal"><div class="modal-content"><h3 class="modal-title">修改文件后缀</h3><input type="text" id="editSuffixInput" placeholder="输入新的文件后缀"><div class="modal-buttons"><button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button><button class="modal-button modal-cancel" id="editSuffixCancel">取消</button></div></div></div>
+      <div id="editSuffixModal" class="modal"><div class="modal-content"><h3 class="modal-title">重命名文件</h3><input type="text" id="editSuffixInput" placeholder="输入新的文件名 (不含扩展名)"><div class="modal-buttons"><button class="modal-button modal-confirm" id="editSuffixConfirm">确认</button><button class="modal-button modal-cancel" id="editSuffixCancel">取消</button></div></div></div>
       <div id="remarkModal" class="modal"><div class="modal-content"><h3 class="modal-title">添加/修改备注</h3><textarea id="remarkInput" placeholder="输入备注信息..."></textarea><div class="modal-buttons"><button class="modal-button modal-confirm" id="remarkConfirm">确认</button><button class="modal-button modal-cancel" id="remarkCancel">取消</button></div></div></div>
     </div>
     <script>
@@ -3968,6 +3968,8 @@ function generateAdminPage(fileCards, categoryOptions) {
 
       async function updateFileSuffix() {
         const newSuffix = document.getElementById('editSuffixInput').value;
+        // BUG 2 FIX: Hide the modal immediately.
+        document.getElementById('editSuffixModal').classList.remove('show');
         try {
           const response = await fetch('/update-suffix', {
             method: 'POST',
@@ -3975,9 +3977,10 @@ function generateAdminPage(fileCards, categoryOptions) {
             body: JSON.stringify({ url: currentEditUrl, suffix: newSuffix })
           });
           const data = await response.json();
+          // BUG 1 FIX: Use "重命名成功" instead of "后缀修改成功" in the message from backend
           showConfirmModal(data.msg, data.status === 1 ? () => window.location.reload() : null, true);
         } catch (error) {
-          showConfirmModal('修改后缀时出错：' + error.message, null, true);
+          showConfirmModal('重命名时出错：' + error.message, null, true);
         }
       }
 
@@ -4028,7 +4031,7 @@ async function handleUpdateSuffixRequest(request, config) {
     if (!url || !suffix) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '文件链接和后缀不能为空'
+        msg: '文件链接和新名称不能为空'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
     const originalFileName = getFileName(url);
@@ -4052,7 +4055,7 @@ async function handleUpdateSuffixRequest(request, config) {
     if (existingFile) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '后缀已存在，无法修改'
+        msg: '文件名已存在，无法修改'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
     const existingUrl = await config.database.prepare('SELECT * FROM files WHERE url = ? AND id != ?')
@@ -4060,7 +4063,7 @@ async function handleUpdateSuffixRequest(request, config) {
     if (existingUrl) {
       return new Response(JSON.stringify({
         status: 0,
-        msg: '该URL已被使用，请尝试其他后缀'
+        msg: '该URL已被使用，请尝试其他名称'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
     console.log('准备更新文件:', {
@@ -4072,11 +4075,13 @@ async function handleUpdateSuffixRequest(request, config) {
       新URL: fileUrl
     });
     if (fileRecord.storage_type === 'telegram') {
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
+      // BUG 3 FIX: Update both url and file_name for consistency
+      await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+        .bind(fileUrl, newFileName, fileRecord.id).run();
       console.log('Telegram文件更新完成:', {
         id: fileRecord.id,
-        新URL: fileUrl
+        新URL: fileUrl,
+        新文件名: newFileName,
       });
     }
     else if (config.bucket) {
@@ -4089,39 +4094,45 @@ async function handleUpdateSuffixRequest(request, config) {
           const fileData = await file.arrayBuffer();
           await storeFile(fileData, newFileName, file.httpMetadata.contentType, config);
           await deleteFile(fileId, config);
-          await config.database.prepare('UPDATE files SET fileId = ?, url = ? WHERE id = ?')
-            .bind(newFileName, fileUrl, fileRecord.id).run();
+          // BUG 3 FIX: Update file_name here as well
+          await config.database.prepare('UPDATE files SET fileId = ?, url = ?, file_name = ? WHERE id = ?')
+            .bind(newFileName, fileUrl, newFileName, fileRecord.id).run();
           console.log('R2文件更新完成:', {
             id: fileRecord.id,
             新fileId: newFileName,
-            新URL: fileUrl
+            新URL: fileUrl,
+            新文件名: newFileName,
           });
         } else {
-          console.log('R2中未找到文件，只更新URL:', fileId);
-          await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-            .bind(fileUrl, fileRecord.id).run();
+          console.log('R2中未找到文件，只更新数据库记录:', fileId);
+           // BUG 3 FIX: Update file_name here as well
+          await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+            .bind(fileUrl, newFileName, fileRecord.id).run();
         }
       } catch (error) {
         console.error('处理R2文件重命名失败:', error);
-        await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-          .bind(fileUrl, fileRecord.id).run();
+        // BUG 3 FIX: Update file_name here as well
+        await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+          .bind(fileUrl, newFileName, fileRecord.id).run();
       }
     }
     else {
-      console.log('未知存储类型，只更新URL');
-      await config.database.prepare('UPDATE files SET url = ? WHERE id = ?')
-        .bind(fileUrl, fileRecord.id).run();
+      console.log('未知存储类型，只更新数据库记录');
+      // BUG 3 FIX: Update file_name here as well
+      await config.database.prepare('UPDATE files SET url = ?, file_name = ? WHERE id = ?')
+        .bind(fileUrl, newFileName, fileRecord.id).run();
     }
     return new Response(JSON.stringify({
       status: 1,
-      msg: '后缀修改成功',
+      // BUG 1 FIX: Change message text
+      msg: '重命名成功',
       newUrl: fileUrl
     }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
-    console.error('更新后缀失败:', error);
+    console.error('更新文件名失败:', error);
     return new Response(JSON.stringify({
       status: 0,
-      msg: '更新后缀失败: ' + error.message
+      msg: '更新文件名失败: ' + error.message
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
@@ -4371,9 +4382,9 @@ try {
       console.log('DOM加载完成，初始化页面元素引用');
       window.editSuffixModal = document.getElementById('editSuffixModal');
       if (window.editSuffixModal) {
-        console.log('成功获取修改后缀弹窗元素');
+        console.log('成功获取重命名弹窗元素');
       } else {
-        console.error('无法获取修改后缀弹窗元素');
+        console.error('无法获取重命名弹窗元素');
       }
       window.currentEditUrl = '';
       window.shareFile = shareFile;

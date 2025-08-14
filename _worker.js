@@ -1884,7 +1884,6 @@ async function handleUploadRequest(request, config) {
     } else {
       let method = 'sendDocument';
       let field = 'document';
-      //--- START OF FIX: SVG and special image handling ---
       if (mainType === 'image' && !['svg+xml', 'x-icon', 'gif'].includes(subType)) {
         method = 'sendPhoto';
         field = 'photo';
@@ -1895,7 +1894,6 @@ async function handleUploadRequest(request, config) {
         method = 'sendAudio';
         field = 'audio';
       }
-      //--- END OF FIX ---
       
       let messageId = null;
       let fileId = null;
@@ -1908,7 +1906,6 @@ async function handleUploadRequest(request, config) {
         { method: 'POST', body: tgFormData }
       );
 
-      //--- START OF FIX: Fallback to sendDocument ---
       if (!tgResponse.ok) {
         const errorText = await tgResponse.text();
         console.error(`Telegram API错误 (${method}):`, errorText);
@@ -1943,7 +1940,6 @@ async function handleUploadRequest(request, config) {
           fileId = result.document?.file_id || result.video?.file_id || result.audio?.file_id;
         }
       }
-      //--- END OF FIX ---
 
       if (!fileId) throw new Error('未获取到文件ID');
       if (!messageId) throw new Error('未获取到tg消息ID');
@@ -2097,9 +2093,10 @@ async function handleAdminRequest(request, config) {
         const sanitizedFileName = (file.file_name || '').replace(/"/g, '&quot;');
         const sanitizedRemark = (file.remark || '').replace(/"/g, '&quot;');
         const fullDate = formatDate(file.created_at);
+        const timestamp = new Date(file.created_at).getTime() || 0;
         const storageType = file.storage_type || 'telegram';
         return `
-          <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
+          <div class="file-card" data-timestamp="${timestamp}" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
             <div class="file-info-wrapper">
                 <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
                 <div class="file-preview">
@@ -2158,9 +2155,10 @@ async function handleSearchRequest(request, config) {
              const sanitizedFileName = (file.file_name || '').replace(/"/g, '&quot;');
              const sanitizedRemark = (file.remark || '').replace(/"/g, '&quot;');
              const fullDate = formatDate(file.created_at);
+             const timestamp = new Date(file.created_at).getTime() || 0;
              const storageType = file.storage_type || 'telegram';
              return `
-              <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
+              <div class="file-card" data-timestamp="${timestamp}" data-url="${url}" data-category-id="${file.category_id || ''}" data-file-name="${sanitizedFileName}" data-remark="${sanitizedRemark}">
                  <div class="file-info-wrapper">
                     <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
                     <div class="file-preview">
@@ -3449,7 +3447,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       }
       h2 { color: #2c3e50; margin: 0; font-size: 1.8rem; }
       .header-right { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
-      .search, .category-filter, .view-switcher button {
+      .search, .category-filter, .view-switcher button, .sort-toggle-btn {
         padding: 0.7rem; border: 2px solid #dfe6e9; border-radius: 8px;
         font-size: 0.9rem; background: #fff; transition: all 0.3s ease;
         box-shadow: 0 2px 5px rgba(0,0,0,0.05);
@@ -3465,6 +3463,8 @@ function generateAdminPage(fileCards, categoryOptions) {
       .view-switcher button:first-child { border-top-left-radius: 8px; border-bottom-left-radius: 8px; }
       .view-switcher button:last-child { border-top-right-radius: 8px; border-bottom-right-radius: 8px; border-left: none; }
       .view-switcher button.active { background: #3498db; color: white; border-color: #3498db; }
+
+      .sort-toggle-btn { cursor: pointer; display: inline-flex; align-items: center; gap: 0.5rem; }
 
       .action-bar {
         background: rgba(255, 255, 255, 0.95); padding: 1.5rem; border-radius: 15px;
@@ -3484,23 +3484,12 @@ function generateAdminPage(fileCards, categoryOptions) {
       .change-category-btn { background: #27ae60; }
       .action-button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
 
-      /* Storage Badge */
       .storage-badge {
-        display: inline-block;
-        padding: 2px 6px;
-        font-size: 0.75em;
-        font-weight: bold;
-        color: white;
-        border-radius: 5px;
-        margin-left: 8px;
-        vertical-align: middle;
+        display: inline-block; padding: 2px 6px; font-size: 0.75em; font-weight: bold;
+        color: white; border-radius: 5px; margin-left: 8px; vertical-align: middle;
       }
-      .storage-telegram {
-        background-color: #3498db; /* Blue */
-      }
-      .storage-r2 {
-        background-color: #f39c12; /* Orange */
-      }
+      .storage-telegram { background-color: #3498db; }
+      .storage-r2 { background-color: #f39c12; }
 
       /* Grid View */
       .grid-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1.5rem; }
@@ -3508,23 +3497,15 @@ function generateAdminPage(fileCards, categoryOptions) {
         background: rgba(255, 255, 255, 0.95); border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         overflow: hidden; position: relative; transition: all 0.3s ease; cursor: pointer;
         display: flex; flex-direction: column;
-        outline: 3px solid transparent;
-        outline-offset: -3px;
+        outline: 3px solid transparent; outline-offset: -3px;
       }
       .grid-view .file-card:hover { transform: translateY(-5px); box-shadow: 0 8px 20px rgba(0,0,0,0.15); }
-      .grid-view .file-card.selected {
-        outline-color: #3498db;
-      }
-      .grid-view .file-info-wrapper {
-        display: flex;
-        flex-direction: column;
-        flex-grow: 1;
-        position: relative;
-      }
+      .grid-view .file-card.selected { outline-color: #3498db; }
+      .grid-view .file-info-wrapper, .grid-view .file-info { display: flex; flex-direction: column; flex-grow: 1; }
       .grid-view .file-checkbox { position: absolute; top: 10px; left: 10px; z-index: 5; width: 20px; height: 20px; }
       .grid-view .file-preview { height: 150px; background: #f8f9fa; display: flex; align-items: center; justify-content: center; }
       .grid-view .file-preview img, .grid-view .file-preview video { max-width: 100%; max-height: 100%; object-fit: contain; }
-      .grid-view .file-info { padding: 1rem; font-size: 0.9rem; color: #2c3e50; flex-grow: 1; max-height: 140px; overflow-y: auto; }
+      .grid-view .file-info { padding: 1rem; font-size: 0.9rem; color: #2c3e50; max-height: 140px; overflow-y: auto; }
       .grid-view .info-item { display: block; margin-bottom: 5px; word-wrap: break-word; }
       .grid-view .original-name, .grid-view .remark-text { font-size: 0.9em; color: #555; }
       .grid-view .file-actions { padding: 0.75rem; border-top: 1px solid #eee; display: flex; justify-content: space-between; gap: 0.5rem; }
@@ -3532,15 +3513,12 @@ function generateAdminPage(fileCards, categoryOptions) {
       /* List View */
       .list-view { background: white; border-radius: 15px; padding: 1rem; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
       .list-header {
-          display: grid;
-          grid-template-columns: var(--list-grid-columns);
-          padding: 0 1rem; gap: 1rem; margin-bottom: 0.5rem; font-weight: bold; color: #2c3e50;
-          align-items: center;
+          display: grid; grid-template-columns: var(--list-grid-columns);
+          padding: 0 1rem; gap: 1rem; margin-bottom: 0.5rem; font-weight: bold; color: #2c3e50; align-items: center;
       }
       .list-header > div:first-child { grid-column: 2; }
       .list-view .file-card {
-        display: grid;
-        grid-template-columns: var(--list-grid-columns);
+        display: grid; grid-template-columns: var(--list-grid-columns);
         align-items: center; padding: 0.5rem 1rem; box-shadow: none;
         border-bottom: 1px solid #ecf0f1; border-radius: 0; transition: background-color 0.2s;
       }
@@ -3592,9 +3570,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       #remarkModal textarea { height: 100px; resize: vertical; }
 
       @media (max-width: 992px) {
-        :root {
-            --list-grid-columns: 40px 2fr 1fr 1.2fr 135px;
-        }
+        :root { --list-grid-columns: 40px 2fr 1fr 1.2fr 135px; }
         .list-header .category-col, .list-view .category-col,
         .list-header .remark-col, .list-view .remark-col { display: none; }
       }
@@ -3607,9 +3583,7 @@ function generateAdminPage(fileCards, categoryOptions) {
         .grid-view { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
       }
       @media (max-width: 480px) {
-         :root {
-            --list-grid-columns: 40px 1fr 135px;
-         }
+         :root { --list-grid-columns: 40px 1fr 135px; }
          .grid-view { grid-template-columns: 1fr; }
          .list-header .size-col, .list-view .size-col,
          .list-header .date-col, .list-view .date-col,
@@ -3628,6 +3602,15 @@ function generateAdminPage(fileCards, categoryOptions) {
             <option value="">所有分类</option>
             ${categoryOptions}
           </select>
+          <button id="sort-toggle-btn" class="sort-toggle-btn" title="切换排序">
+            <span>排序</span>
+            <svg id="sort-desc-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+              <path fill-rule="evenodd" d="M8 1a.5.5 0 0 1 .5.5v11.793l3.146-3.147a.5.5 0 0 1 .708.708l-4 4a.5.5 0 0 1-.708 0l-4-4a.5.5 0 0 1 .708-.708L7.5 13.293V1.5A.5.5 0 0 1 8 1z"/>
+            </svg>
+            <svg id="sort-asc-icon" style="display:none;" xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+              <path fill-rule="evenodd" d="M8 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L7.5 2.707V14.5a.5.5 0 0 0 .5.5z"/>
+            </svg>
+          </button>
           <div class="view-switcher">
             <button id="list-view-btn" class="view-btn" title="列表视图">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M2.5 12a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h10a.5.5 0 0 1 0 1H3a.5.5 0 0 1-.5-.5"/></svg>
@@ -3680,6 +3663,7 @@ function generateAdminPage(fileCards, categoryOptions) {
       let currentConfirmCallback = null;
       let currentEditUrl = '';
       let searchTimeout;
+      let currentSortOrder = 'desc';
 
       document.addEventListener('DOMContentLoaded', function() {
         const searchInput = document.getElementById('search-input');
@@ -3695,12 +3679,31 @@ function generateAdminPage(fileCards, categoryOptions) {
         const remarkCancel = document.getElementById('remarkCancel');
         const listViewBtn = document.getElementById('list-view-btn');
         const gridViewBtn = document.getElementById('grid-view-btn');
+        const sortToggleBtn = document.getElementById('sort-toggle-btn');
+        
+        const fileGrid = document.getElementById('fileGrid');
 
         searchInput.addEventListener('input', () => {
             clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(() => filterFiles(true), 300);
+            searchTimeout = setTimeout(async () => {
+                const query = searchInput.value;
+                if (!query) {
+                    fileGrid.innerHTML = originalFileCardsHTML;
+                } else {
+                    const response = await fetch('/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query })
+                    });
+                    const data = await response.json();
+                    fileGrid.innerHTML = data.html;
+                }
+                initializeFileCards();
+                filterFiles();
+            }, 300);
         });
-        categoryFilter.addEventListener('change', () => filterFiles(false));
+
+        categoryFilter.addEventListener('change', () => filterFiles());
         selectAllBtn.addEventListener('click', toggleSelectAll);
         deleteFilesBtn.addEventListener('click', confirmDeleteSelected);
         remarkFilesBtn.addEventListener('click', showRemarkModal);
@@ -3712,10 +3715,13 @@ function generateAdminPage(fileCards, categoryOptions) {
         remarkCancel.addEventListener('click', () => document.getElementById('remarkModal').classList.remove('show'));
         listViewBtn.addEventListener('click', () => setViewMode('list'));
         gridViewBtn.addEventListener('click', () => setViewMode('grid'));
+        sortToggleBtn.addEventListener('click', toggleSortOrder);
+
         document.getElementById('confirmModalConfirm').addEventListener('click', () => { if (currentConfirmCallback) currentConfirmCallback(); closeConfirmModal(); });
         document.getElementById('confirmModalCancel').addEventListener('click', closeConfirmModal);
         window.addEventListener('click', handleWindowClick);
-
+        
+        const originalFileCardsHTML = fileGrid.innerHTML;
         initializeFileCards();
         loadViewMode();
         setBingBackground();
@@ -3746,26 +3752,45 @@ function generateAdminPage(fileCards, categoryOptions) {
           setViewMode(localStorage.getItem('fileViewMode') || 'grid');
       }
 
+      function sortFiles() {
+          const fileGrid = document.getElementById('fileGrid');
+          const cards = Array.from(fileGrid.querySelectorAll('.file-card'));
+          cards.sort((a, b) => {
+              const timeA = parseInt(a.dataset.timestamp, 10);
+              const timeB = parseInt(b.dataset.timestamp, 10);
+              return currentSortOrder === 'desc' ? timeB - timeA : timeA - timeB;
+          });
+          cards.forEach(card => fileGrid.appendChild(card));
+      }
+      
+      function updateSortIcon() {
+          const sortDescIcon = document.getElementById('sort-desc-icon');
+          const sortAscIcon = document.getElementById('sort-asc-icon');
+          sortDescIcon.style.display = (currentSortOrder === 'desc') ? 'inline' : 'none';
+          sortAscIcon.style.display = (currentSortOrder === 'asc') ? 'inline' : 'none';
+      }
+
+      function toggleSortOrder() {
+          currentSortOrder = (currentSortOrder === 'desc') ? 'asc' : 'desc';
+          updateSortIcon();
+          sortFiles();
+      }
+
       function filterFiles() {
-          const searchTerm = document.getElementById('search-input').value.toLowerCase();
           const selectedCategory = document.getElementById('category-filter').value;
           const isListView = document.getElementById('fileGrid').classList.contains('list-view');
 
           document.querySelectorAll('.file-card').forEach(card => {
-              const fileName = (card.dataset.url.split('/').pop() || '').toLowerCase();
-              const originalFileName = (card.dataset.fileName || '').toLowerCase();
-              const remark = (card.dataset.remark || '').toLowerCase();
               const categoryId = card.dataset.categoryId || '';
-
-              const matchesSearch = searchTerm === '' || fileName.includes(searchTerm) || originalFileName.includes(searchTerm) || remark.includes(searchTerm);
               const matchesCategory = selectedCategory === '' || categoryId === selectedCategory;
 
-              if(matchesSearch && matchesCategory) {
+              if (matchesCategory) {
                  card.style.display = isListView ? 'grid' : 'flex';
               } else {
                  card.style.display = 'none';
               }
           });
+          sortFiles();
       }
 
       function initializeFileCards() {
